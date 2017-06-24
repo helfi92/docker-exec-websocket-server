@@ -1,24 +1,16 @@
-var _ = require('lodash');
-var assert = require('assert');
-var debug = require('debug')('docker-exec-websocket-server:lib:client');
-var debugdata = require('debug')('docker-exec-websocket-server:lib:rcv');
-var EventEmitter = require('events').EventEmitter;
-var msgcode = require('../lib/messagecodes.js');
-var querystring = require('querystring');
-var through2 = require('through2').obj;
-var WS = require('ws');
-var Promise = require('promise');
+const EventEmitter = require('wolfy87-eventemitter');
+const msgcode = require('../lib/messagecodes.js');
+const querystring = require('querystring');
+const through2 = require('through2').obj;
+const Promise = require('promise');
 
-var BROWSER = typeof window === 'undefined';
-
-export default class DockerExecWebsocketClient extends EventEmitter {
+module.exports = class DockerExecWebsocketClient extends EventEmitter {
   constructor(options) {
     super();
-    this.options = _.defaults({}, options, {
+    this.options = Object.assign({}, {
       tty: true,
       command: 'sh',
-      wsopts: {},
-    });
+    }, options);
   }
 
   /* Makes a client program with unbroken stdin, stdout, stderr streams
@@ -35,26 +27,21 @@ export default class DockerExecWebsocketClient extends EventEmitter {
       tty: this.options.tty ? 'true' : 'false',
       command: this.options.command,
     });
-    debug(this.url);
-    assert(/ws?s:\/\//.test(this.url), 'url required or malformed url input');
 
-    //HACK: browser check
-    if (BROWSER) { //means that this is probably node
-      this.socket = new WS(this.url, this.options.wsopts);
-    } else { //means this is probably a browser, which means we ignore options
-      this.socket = new WebSocket(this.url);
+    if (!/ws?s:\/\//.test(this.url)) {
+      throw(new Error('URL required or malformed'));
     }
 
+    this.socket = new WebSocket(this.url);
     this.socket.binaryType = 'arraybuffer';
     this.socket.addEventListener('open', () => {
-      debug('socket opened');
-      this.emit('open');
+      this.emitEvent('open');
     });
 
     this.stdin = through2((data, enc, cb) => {
       this.sendMessage(msgcode.stdin, data);
       cb();
-    }, (cb) => {
+    }, cb => {
       this.sendCode(msgcode.end);
       cb();
     });
@@ -64,27 +51,17 @@ export default class DockerExecWebsocketClient extends EventEmitter {
 
     //stream with pause buffering, everything passes thru here first
     this.strbuf = through2();
-    this.strbuf.on('data', (data) => {
+    this.strbuf.on('data', data => {
       this.outstandingBytes += data.length;
-      debug(this.outstandingBytes);
-      if (BROWSER) {
-        this.socket.send(data, {binary: true}, () => {
-          this.outstandingBytes -= data.length;
-          debug(this.outstandingBytes);
-        });
-      } else {
-        this.socket.send(data);
-        this.outstandingBytes -= data.length;
-        debug(this.outstandingBytes);
-      }
+      this.socket.send(data);
+      this.outstandingBytes -= data.length;
+  
       if (this.outstandingBytes > MAX_OUTSTANDING_BYTES) {
         this.strbuf.pause();
-        this.emit('paused');
-        debug('paused');
+        this.emitEvent('paused');
       } else {
         this.strbuf.resume();
-        this.emit('resumed');
-        debug('resumed');
+        this.emitEvent('resumed');
       }
     });
     //Starts out paused so that input isn't sent until server is ready
@@ -109,34 +86,31 @@ export default class DockerExecWebsocketClient extends EventEmitter {
       }
     });
 
-    this.socket.onmessage = (messageEvent) => {
+    this.socket.onmessage = messageEvent => {
       this.messageHandler(messageEvent);
     };
+
     await new Promise((accept, reject) => {
       this.socket.addEventListener('error', reject);
       this.socket.addEventListener('open', accept);
     });
-    this.socket.addEventListener('error', err => this.emit('error', err));
-    debug('client connected');
+    this.socket.addEventListener('error', err => this.emitEvent('error', err));
   }
 
   messageHandler(messageEvent) {
-    var message = new Buffer(new Uint8Array(messageEvent.data));
-    debugdata(message);
+    let message = new Uint8Array(messageEvent.data);
     // the first byte is the message code
     switch (message[0]) {
       //pauses the client, causing strbuf to buffer
       case msgcode.pause:
         this.strbuf.pause();
-        this.emit('paused');
-        debug('paused');
+        this.emitEvent('paused');
         break;
 
       //resumes the client, flushing strbuf
       case msgcode.resume:
         this.strbuf.resume();
-        this.emit('resumed');
-        debug('resumed');
+        this.emitEvent('resumed');
         break;
 
       case msgcode.stdout:
@@ -155,43 +129,50 @@ export default class DockerExecWebsocketClient extends EventEmitter {
 
       //first byte contains exit code
       case msgcode.stopped:
-        this.emit('exit', message.readInt8(1));
+        this.emitEvent('exit', message.readInt8(1));
         this.close();
         break;
 
       case msgcode.shutdown:
-        this.emit('shutdown');
-        debug('server has shut down');
+        this.emitEvent('shutdown');
         this.close();
         break;
 
       case msgcode.error:
-        this.emit('error', message.slice(1));
+        this.emitEvent('error', message.slice(1));
         break;
-
+      
       default:
-        debug('unknown msg code %s', message[0]);
+        break;
     }
   }
 
   resize(h, w) {
     if (!this.options.tty) {
       throw new Error('cannot resize, not a tty instance');
-    } else {
-      var buf = new Buffer(4);
-      buf.writeUInt16LE(h, 0);
-      buf.writeUInt16LE(w, 2);
-      debug('resized to %sx%s', h, w);
-      this.sendMessage(msgcode.resize, buf);
     }
+    
+    const buf = new Uint8Array(4);
+
+    this.sendCode(msgcode.resume);
+    buf.set(new Uint16Array([h]), 0);
+    buf.set(new Uint16Array([w]), 2);
+    this.sendMessage(msgcode.resize, buf);
   }
 
   sendCode(code) {
-    this.strbuf.write(new Buffer([code]));
+    this.strbuf.write(new Uint8Array([code]));
   }
 
   sendMessage(code, data) {
-    this.strbuf.write(Buffer.concat([new Buffer([code]), new Buffer(data)]));
+    code = new Uint8Array([code]);
+    data = data instanceof Uint8Array ? data : new Uint8Array([data.charCodeAt(0)]);
+    const message = new Uint8Array(data.length + code.length);
+    
+    message.set(code);
+    message.set(data, code.length);
+
+    this.strbuf.write(message);
   }
 
   close() {
@@ -211,4 +192,4 @@ export default class DockerExecWebsocketClient extends EventEmitter {
       });
     }
   }
-}
+};
